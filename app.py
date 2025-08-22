@@ -1,3 +1,4 @@
+# app.py
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -12,41 +13,51 @@ def equity_curve(r: pd.Series) -> pd.Series:
     return (1.0 + r).cumprod()
 
 def eval_portfolio(port_rets: pd.Series):
+    port_rets = port_rets.dropna()
+    if port_rets.empty:
+        return {"CAGR": np.nan, "Volatility": np.nan, "Sharpe": np.nan, "MaxDD": np.nan}, pd.Series(dtype=float)
+
     eq = equity_curve(port_rets)
-    avg = port_rets.mean()
-    vol = port_rets.std(ddof=1)
-    sharpe = (avg / vol) * np.sqrt(252) if vol and vol > 0 else np.nan
+    avg = float(port_rets.mean())
+    vol = float(port_rets.std(ddof=1))
+    sharpe = (avg / vol) * np.sqrt(252) if (np.isfinite(vol) and vol > 0) else np.nan
     cagr = (eq.iloc[-1] ** (252 / len(eq)) - 1.0) if len(eq) > 0 else np.nan
     mdd = float((eq / eq.cummax() - 1.0).min()) if len(eq) > 0 else np.nan
     return {"CAGR": cagr, "Volatility": vol, "Sharpe": sharpe, "MaxDD": mdd}, eq
 
-# Robust loader that handles DD-MM-YYYY, YYYY-MM-DD, mixed, and unknown date column names
+# Robust loader that handles DD‑MM‑YYYY, YYYY‑MM‑DD, mixed, and unknown date column names
 @st.cache_data
 def load_data(file) -> pd.DataFrame:
     df_raw = pd.read_csv(file)
 
-    # Auto-detect date column (case-insensitive); fallback to the first col
+    # Auto-detect date column (case-insensitive); fallback to the first column
     date_col = None
     for c in df_raw.columns:
-        if any(k in c.lower() for k in ("date", "time", "timestamp")):
-            date_col = c; break
+        if any(k in str(c).lower() for k in ("date", "time", "timestamp")):
+            date_col = c
+            break
     if date_col is None:
         date_col = df_raw.columns[0]
 
-    # Parse dates (support mixed + dayfirst)
+    # Parse dates (support mixed + dayfirst for 13-01-2018 style)
     df_raw[date_col] = pd.to_datetime(
         df_raw[date_col],
-        errors="coerce",          # invalid -> NaT
-        dayfirst=True,            # supports 13-01-2018 style
-        format="mixed"            # pandas >= 2.0 mixed formats
+        errors="coerce",
+        dayfirst=True,
+        format="mixed"  # pandas >= 2.0
     )
-    df = df_raw.dropna(subset=[date_col]).set_index(date_col).sort_index()
+    df = (
+        df_raw
+        .dropna(subset=[date_col])
+        .set_index(date_col)
+        .sort_index()
+    )
 
-    # Keep only numeric columns (silently drops strings like tickers)
+    # Keep only numeric columns (drop any non-numeric like tickers)
     num = df.select_dtypes(include=["number"]).copy()
     if num.shape[1] == 0:
         raise ValueError("No numeric asset columns found after parsing. "
-                         "Ensure your CSV has numbers for asset columns.")
+                         "Ensure your CSV has numeric prices/returns after the date column.")
 
     # Decide: prices or returns?
     looks_like_prices = (num.max() > 5).any()
@@ -54,7 +65,7 @@ def load_data(file) -> pd.DataFrame:
         st.info("Detected prices — converting to simple daily returns.")
         num = num.pct_change().replace([np.inf, -np.inf], np.nan).dropna(how="any")
 
-    # Make index continuous daily and ffill gaps (typical for markets)
+    # Fill calendar gaps with ffill (markets often have missing days)
     all_days = pd.date_range(num.index.min(), num.index.max(), freq="D")
     num = num.reindex(all_days).ffill().dropna(how="all")
     num.index.name = "Date"
@@ -69,32 +80,29 @@ def load_data(file) -> pd.DataFrame:
 def simulate_equal_weight(df: pd.DataFrame, tc=0.0005) -> pd.Series:
     w = np.ones(df.shape[1]) / df.shape[1]
     r = (df @ w).astype(float)
-    # simple daily rebalance with tc if you want:
-    # r = r - tc * 0  # (no turnover here since w is constant)
+    # No transaction costs modeled here (constant weights)
     return r
 
 def simulate_buy_and_hold(df: pd.DataFrame) -> pd.Series:
-    # start equal-weighted (align to columns!)
+    # Start equal-weighted (align to columns to avoid fill errors)
     w0 = pd.Series(np.ones(df.shape[1]) / df.shape[1], index=df.columns)
 
-    # grow each asset with its own cumulative return
+    # Grow each asset with its own cumulative return
     eq = (1.0 + df).cumprod()
 
-    # value weights each day (normalize across columns)
+    # Value weights each day (normalize across columns)
     wts = eq.div(eq.sum(axis=1), axis=0)
 
-    # use previous day's weights to compute today's portfolio return
+    # Use previous day's weights to compute today's return
     wts_shifted = wts.shift()
 
-    # for the very first day after shift (NaNs), use starting weights
+    # For the first day (NaNs after shift), use starting weights
     if len(wts_shifted) > 0:
+        # Assign a Series to the first row (safe, column-aligned)
         wts_shifted.iloc[0] = w0
 
-    # portfolio daily return
     r = (df * wts_shifted).sum(axis=1)
     return r
-
-
 
 def simulate_naive_momentum(df: pd.DataFrame, lookback=60) -> pd.Series:
     roll = (1.0 + df).rolling(lookback).apply(lambda x: np.prod(x) - 1.0, raw=False)
@@ -155,7 +163,7 @@ except Exception as e:
     st.stop()
 
 with st.expander("Options"):
-    lookback = st.slider("Lookback (days) for Momentum / InvVol / MinVar", 20, 180, 60)
+    lookback = st.slider("Lookback (days) for Momentum / Inverse Vol / MinVar", 20, 180, 60)
 
 if st.button("Run backtests"):
     with st.spinner("Running strategies…"):
@@ -168,12 +176,15 @@ if st.button("Run backtests"):
             "RL (placeholder)": simulate_rl_placeholder(rets),
         }
 
-        # Metrics & equity curves
+        # Metrics & equity curves (align to a common index)
+        common_idx = None
+        for r in strategies.values():
+            common_idx = r.index if common_idx is None else common_idx.intersection(r.index)
+
         metrics = []
         eq_curves = {}
         for name, r in strategies.items():
-            # Align to common index (shorter series like MinVar start after lookback)
-            aligned = r.loc[rets.index.intersection(r.index)]
+            aligned = r.reindex(common_idx).dropna()
             perf, eq = eval_portfolio(aligned)
             metrics.append([name, perf["CAGR"], perf["Volatility"], perf["Sharpe"], perf["MaxDD"]])
             eq_curves[name] = eq
@@ -187,5 +198,4 @@ if st.button("Run backtests"):
         st.subheader("📈 Equity Curves")
         eq_df = pd.DataFrame(eq_curves)
         st.line_chart(eq_df)
-
 
