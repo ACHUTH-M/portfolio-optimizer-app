@@ -6,149 +6,198 @@ from scipy.optimize import minimize
 
 st.set_page_config(page_title="Portfolio Optimizer", layout="wide")
 
-# -------------------------
-# Utilities
-# -------------------------
+# =========================
+# Helpers & metrics
+# =========================
 def equity_curve(r: pd.Series) -> pd.Series:
     return (1.0 + r).cumprod()
 
-def eval_portfolio(port_rets: pd.Series):
+def _ann_factor(freq_code: str):
+    return 252 if freq_code == "D" else (52 if freq_code == "W" else 12)
+
+def eval_portfolio(port_rets: pd.Series, weights_history=None, freq_code="D"):
     port_rets = port_rets.dropna()
     if port_rets.empty:
-        return {"CAGR": np.nan, "Volatility": np.nan, "Sharpe": np.nan, "MaxDD": np.nan}, pd.Series(dtype=float)
-
+        nan = float("nan")
+        return {"CAGR": nan, "Volatility": nan, "Sharpe": nan, "Sortino": nan,
+                "Calmar": nan, "MaxDD": nan, "VaR5": nan, "CVaR5": nan, "Turnover": nan}, pd.Series(dtype=float)
+    af = _ann_factor(freq_code)
     eq = equity_curve(port_rets)
-    avg = float(port_rets.mean())
-    vol = float(port_rets.std(ddof=1))
-    sharpe = (avg / vol) * np.sqrt(252) if (np.isfinite(vol) and vol > 0) else np.nan
-    cagr = (eq.iloc[-1] ** (252 / len(eq)) - 1.0) if len(eq) > 0 else np.nan
-    mdd = float((eq / eq.cummax() - 1.0).min()) if len(eq) > 0 else np.nan
-    return {"CAGR": cagr, "Volatility": vol, "Sharpe": sharpe, "MaxDD": mdd}, eq
+    m = float(port_rets.mean())
+    s = float(port_rets.std(ddof=1))
+    neg = port_rets[port_rets < 0]
+    d = float(neg.std(ddof=1)) if len(neg) > 1 else float("nan")
+    sharpe = (m / s) * np.sqrt(af) if (s and s > 0) else np.nan
+    sortino = (m / d) * np.sqrt(af) if (d and d > 0) else np.nan
+    cagr = (eq.iloc[-1] ** (af / len(eq)) - 1.0)
+    mdd_series = (eq / eq.cummax() - 1.0)
+    maxdd = float(mdd_series.min())
+    calmar = (cagr / abs(maxdd)) if maxdd < 0 else np.nan
+    var5 = float(np.percentile(port_rets, 5))
+    cvar5 = float(neg.mean()) if len(neg) else np.nan
 
-# Robust loader that handles DD‑MM‑YYYY, YYYY‑MM‑DD, mixed, and unknown date column names
+    turnover = 0.0
+    if isinstance(weights_history, list) and len(weights_history) > 1:
+        diffs = [np.abs(weights_history[i] - weights_history[i-1]).sum() for i in range(1, len(weights_history))]
+        turnover = float(np.mean(diffs))
+
+    return {"CAGR": cagr, "Volatility": s, "Sharpe": sharpe, "Sortino": sortino,
+            "Calmar": calmar, "MaxDD": maxdd, "VaR5": var5, "CVaR5": cvar5, "Turnover": turnover}, eq
+
+def apply_rebalance_freq(rets: pd.DataFrame, freq_label: str) -> pd.DataFrame:
+    """Resample returns to the chosen rebalance frequency (by compounding)."""
+    if freq_label == "Daily":
+        return rets
+    rule = {"Weekly": "W-FRI", "Monthly": "M"}[freq_label]
+    eq = (1.0 + rets).cumprod()
+    eq_f = eq.resample(rule).last().dropna(how="all")
+    rets_f = eq_f.pct_change().dropna(how="any")
+    return rets_f
+
+# =========================
+# Robust CSV loader
+# =========================
 @st.cache_data
 def load_data(file) -> pd.DataFrame:
     df_raw = pd.read_csv(file)
 
-    # Auto-detect date column (case-insensitive); fallback to the first column
+    # Auto-detect date col (case-insensitive); fallback to first col
     date_col = None
     for c in df_raw.columns:
         if any(k in str(c).lower() for k in ("date", "time", "timestamp")):
-            date_col = c
-            break
+            date_col = c; break
     if date_col is None:
         date_col = df_raw.columns[0]
 
-    # Parse dates (support mixed + dayfirst for 13-01-2018 style)
+    # Parse dates (mixed formats + day-first support)
     df_raw[date_col] = pd.to_datetime(
         df_raw[date_col],
         errors="coerce",
         dayfirst=True,
         format="mixed"  # pandas >= 2.0
     )
-    df = (
-        df_raw
-        .dropna(subset=[date_col])
-        .set_index(date_col)
-        .sort_index()
-    )
+    df = (df_raw
+          .dropna(subset=[date_col])
+          .set_index(date_col)
+          .sort_index())
 
-    # Keep only numeric columns (drop any non-numeric like tickers)
+    # Keep only numeric asset columns
     num = df.select_dtypes(include=["number"]).copy()
     if num.shape[1] == 0:
-        raise ValueError("No numeric asset columns found after parsing. "
-                         "Ensure your CSV has numeric prices/returns after the date column.")
+        raise ValueError("No numeric asset columns found after parsing.")
 
-    # Decide: prices or returns?
-    looks_like_prices = (num.max() > 5).any()
-    if looks_like_prices:
+    # Prices or returns?
+    if (num.max() > 5).any():
         st.info("Detected prices — converting to simple daily returns.")
         num = num.pct_change().replace([np.inf, -np.inf], np.nan).dropna(how="any")
 
-    # Fill calendar gaps with ffill (markets often have missing days)
+    # Continuous daily index & forward-fill
     all_days = pd.date_range(num.index.min(), num.index.max(), freq="D")
     num = num.reindex(all_days).ffill().dropna(how="all")
     num.index.name = "Date"
-
-    # Final clean
     num = num.replace([np.inf, -np.inf], np.nan).dropna(how="any")
     return num
 
-# -------------------------
-# Baselines
-# -------------------------
-def simulate_equal_weight(df: pd.DataFrame, tc=0.0005) -> pd.Series:
-    w = np.ones(df.shape[1]) / df.shape[1]
-    r = (df @ w).astype(float)
-    # No transaction costs modeled here (constant weights)
-    return r
+# =========================
+# Strategies (with TC support)
+# =========================
+def simulate_equal_weight(df: pd.DataFrame, tc=0.0):
+    N = df.shape[1]
+    w = np.ones(N)/N
+    r = df @ w
+    hist = [w.copy()] * len(df)  # constant weights → no turnover
+    return r.astype(float), hist
 
-def simulate_buy_and_hold(df: pd.DataFrame) -> pd.Series:
-    # Start equal-weighted (align to columns to avoid fill errors)
+def simulate_buy_and_hold(df: pd.DataFrame, tc=0.0):
     w0 = pd.Series(np.ones(df.shape[1]) / df.shape[1], index=df.columns)
-
-    # Grow each asset with its own cumulative return
     eq = (1.0 + df).cumprod()
-
-    # Value weights each day (normalize across columns)
     wts = eq.div(eq.sum(axis=1), axis=0)
-
-    # Use previous day's weights to compute today's return
     wts_shifted = wts.shift()
-
-    # For the first day (NaNs after shift), use starting weights
     if len(wts_shifted) > 0:
-        # Assign a Series to the first row (safe, column-aligned)
         wts_shifted.iloc[0] = w0
-
+    hist = [w0.values]
+    for i in range(1, len(wts_shifted)):
+        hist.append(wts_shifted.iloc[i].values)
     r = (df * wts_shifted).sum(axis=1)
-    return r
+    w_arr = np.vstack(hist)
+    turnover = np.abs(np.diff(w_arr, axis=0)).sum(axis=1)
+    cost = np.insert(tc * turnover, 0, 0.0)
+    r_net = r - cost
+    return r_net.astype(float), [w for w in hist]
 
-def simulate_naive_momentum(df: pd.DataFrame, lookback=60) -> pd.Series:
+def simulate_naive_momentum(df: pd.DataFrame, lookback=60, tc=0.0):
+    N = df.shape[1]
+    w_curr = np.ones(N)/N
+    hist = [w_curr.copy()]
+    out = []
     roll = (1.0 + df).rolling(lookback).apply(lambda x: np.prod(x) - 1.0, raw=False)
-    pos = (roll > 0).astype(int)
-    wts = pos.div(pos.sum(axis=1).replace(0, np.nan), axis=0).fillna(1.0 / df.shape[1])
-    r = (df * wts.shift().fillna(1.0 / df.shape[1])).sum(axis=1)
-    return r
+    for t in range(len(df)):
+        r_vec = df.iloc[t].values
+        out.append(float(np.dot(w_curr, r_vec)))
+        if t >= lookback-1:
+            mom = roll.iloc[t].values
+            pos = np.clip(mom, 0, None)
+            w_new = pos/pos.sum() if pos.sum() > 0 else np.ones(N)/N
+            out[-1] -= tc * np.abs(w_new - w_curr).sum()
+            w_curr = w_new
+        hist.append(w_curr.copy())
+    return pd.Series(out, index=df.index), hist
 
-def simulate_inverse_vol(df: pd.DataFrame, lookback=60) -> pd.Series:
-    vol = df.rolling(lookback).std(ddof=1)
-    inv = 1.0 / vol.replace(0, np.nan)
-    wts = inv.div(inv.sum(axis=1), axis=0).fillna(1.0 / df.shape[1])
-    r = (df * wts.shift().fillna(1.0 / df.shape[1])).sum(axis=1)
-    return r
+def simulate_inverse_vol(df: pd.DataFrame, lookback=60, tc=0.0, eps=1e-8):
+    N = df.shape[1]
+    w_curr = np.ones(N)/N
+    hist = [w_curr.copy()]
+    out = []
+    for t in range(len(df)):
+        r_vec = df.iloc[t].values
+        out.append(float(np.dot(w_curr, r_vec)))
+        if t >= lookback-1:
+            vol = df.iloc[t-lookback+1:t+1].std().values + eps
+            inv = 1.0 / vol
+            w_new = inv / inv.sum()
+            out[-1] -= tc * np.abs(w_new - w_curr).sum()
+            w_curr = w_new
+        hist.append(w_curr.copy())
+    return pd.Series(out, index=df.index), hist
 
-def simulate_min_variance(df: pd.DataFrame, lookback=60) -> pd.Series:
+def simulate_min_variance(df: pd.DataFrame, lookback=60, tc=0.0):
+    N = df.shape[1]
+    w_curr = np.ones(N)/N
+    hist = [w_curr.copy()]
+    out = []
     def minvar(returns: pd.DataFrame):
         cov = returns.cov().values
         n = cov.shape[0]
-        cov = cov + np.eye(n) * 1e-8  # ridge for stability
-        x0 = np.ones(n) / n
-        cons = ({"type": "eq", "fun": lambda x: np.sum(x) - 1.0},)
-        bounds = [(0, 1)] * n
+        cov = cov + np.eye(n) * 1e-8
+        x0 = np.ones(n)/n
+        cons = ({"type":"eq","fun": lambda x: np.sum(x)-1.0},)
+        bounds = [(0,1)]*n
         res = minimize(lambda x: float(x @ cov @ x), x0, method="SLSQP", bounds=bounds, constraints=cons)
         return res.x if res.success else x0
+    for t in range(len(df)):
+        r_vec = df.iloc[t].values
+        out.append(float(np.dot(w_curr, r_vec)))
+        if t >= lookback-1:
+            w_new = minvar(df.iloc[t-lookback+1:t+1])
+            out[-1] -= tc * np.abs(w_new - w_curr).sum()
+            w_curr = w_new
+        hist.append(w_curr.copy())
+    return pd.Series(out, index=df.index), hist
 
-    out = []
-    idx = df.index[lookback:]
-    for t in range(lookback, len(df)):
-        w = minvar(df.iloc[t - lookback:t])
-        out.append(float(np.dot(w, df.iloc[t].values)))
-    return pd.Series(out, index=idx)
-
-def simulate_rl_placeholder(df: pd.DataFrame) -> pd.Series:
+def simulate_rl_placeholder(df: pd.DataFrame):
     np.random.seed(42)
     w = np.ones(df.shape[1]) / df.shape[1]
     noise = np.random.normal(0, 0.004, size=len(df))
-    return pd.Series(df.dot(w).values + noise, index=df.index)
+    r = pd.Series(df.dot(w).values + noise, index=df.index)
+    hist = [w.copy()] * len(df)
+    return r, hist
 
-# -------------------------
-# UI
-# -------------------------
+# =========================
+# UI — data & controls
+# =========================
 st.title("📈 Portfolio Optimizer with Baselines & RL")
 
 uploaded = st.file_uploader("Upload your returns.csv or prices.csv", type=["csv"])
-
 if not uploaded:
     st.info("Upload a CSV to continue.")
     st.stop()
@@ -159,43 +208,77 @@ try:
     st.dataframe(rets.head())
 except Exception as e:
     st.error(f"Failed to read your CSV. Details: {e}")
-    st.write("**Tips:** Ensure the first column is a date (e.g., 'Date') and other columns are numeric prices/returns.")
+    st.write("**Tips:** First column must be a date; other columns numeric prices/returns.")
     st.stop()
 
-with st.expander("Options"):
-    lookback = st.slider("Lookback (days) for Momentum / Inverse Vol / MinVar", 20, 180, 60)
+with st.sidebar:
+    st.header("⚙️ Settings")
+    freq_label = st.selectbox("Rebalance frequency", ["Daily", "Weekly", "Monthly"], index=0)
+    tc_bps = st.slider("Transaction cost (bps per 100% turnover)", 0, 50, 5, help="10 bps = 0.0010 cost")
+    tc = tc_bps / 10000.0
+    lookback = st.slider("Lookback for Momentum / Inverse Vol / MinVar", 20, 180, 60)
+    enabled = st.multiselect(
+        "Strategies to run",
+        ["Equal Weight","Buy & Hold","Momentum","Inverse Vol","Min Variance","RL (placeholder)"],
+        default=["Equal Weight","Buy & Hold","Momentum","Inverse Vol","Min Variance","RL (placeholder)"]
+    )
 
+# Apply chosen rebalance frequency
+rets_use = apply_rebalance_freq(rets, freq_label)
+freq_code = {"Daily":"D","Weekly":"W","Monthly":"M"}[freq_label]
+
+# =========================
+# Run backtests
+# =========================
 if st.button("Run backtests"):
     with st.spinner("Running strategies…"):
-        strategies = {
-            "Equal Weight": simulate_equal_weight(rets),
-            "Buy & Hold": simulate_buy_and_hold(rets),
-            "Momentum": simulate_naive_momentum(rets, lookback),
-            "Inverse Vol": simulate_inverse_vol(rets, lookback),
-            "Min Variance": simulate_min_variance(rets, lookback),
-            "RL (placeholder)": simulate_rl_placeholder(rets),
-        }
+        sims = {}
+        if "Equal Weight" in enabled:
+            sims["Equal Weight"] = simulate_equal_weight(rets_use, tc=tc)
+        if "Buy & Hold" in enabled:
+            sims["Buy & Hold"] = simulate_buy_and_hold(rets_use, tc=tc)
+        if "Momentum" in enabled:
+            sims["Momentum"] = simulate_naive_momentum(rets_use, lookback=lookback, tc=tc)
+        if "Inverse Vol" in enabled:
+            sims["Inverse Vol"] = simulate_inverse_vol(rets_use, lookback=lookback, tc=tc)
+        if "Min Variance" in enabled:
+            sims["Min Variance"] = simulate_min_variance(rets_use, lookback=lookback, tc=tc)
+        if "RL (placeholder)" in enabled:
+            sims["RL (placeholder)"] = simulate_rl_placeholder(rets_use)
 
-        # Metrics & equity curves (align to a common index)
+        # Common index for fair comparison
         common_idx = None
-        for r in strategies.values():
+        for r, _w in sims.values():
             common_idx = r.index if common_idx is None else common_idx.intersection(r.index)
 
-        metrics = []
-        eq_curves = {}
-        for name, r in strategies.items():
+        # Metrics & curves
+        rows, eq_curves = [], {}
+        for name, (r, w_hist) in sims.items():
             aligned = r.reindex(common_idx).dropna()
-            perf, eq = eval_portfolio(aligned)
-            metrics.append([name, perf["CAGR"], perf["Volatility"], perf["Sharpe"], perf["MaxDD"]])
+            perf, eq = eval_portfolio(aligned, w_hist, freq_code=freq_code)
+            rows.append([name, perf["CAGR"], perf["Volatility"], perf["Sharpe"],
+                         perf["Sortino"], perf["Calmar"], perf["MaxDD"],
+                         perf["VaR5"], perf["CVaR5"], perf["Turnover"]])
             eq_curves[name] = eq
 
         st.subheader("📊 Strategy Comparison")
-        metrics_df = pd.DataFrame(metrics, columns=["Strategy", "CAGR", "Volatility", "Sharpe", "MaxDD"])
+        metrics_df = pd.DataFrame(rows, columns=[
+            "Strategy","CAGR","Volatility","Sharpe","Sortino","Calmar","MaxDD","VaR5","CVaR5","Turnover"
+        ])
         st.dataframe(metrics_df.style.format({
-            "CAGR": "{:.2%}", "Volatility": "{:.2%}", "Sharpe": "{:.2f}", "MaxDD": "{:.2%}"
+            "CAGR":"{:.2%}","Volatility":"{:.2%}","Sharpe":"{:.2f}","Sortino":"{:.2f}",
+            "Calmar":"{:.2f}","MaxDD":"{:.2%}","VaR5":"{:.2%}","CVaR5":"{:.2%}","Turnover":"{:.2f}"
         }))
+
+        st.download_button("⬇️ Download metrics (CSV)",
+            data=metrics_df.to_csv(index=False).encode("utf-8"),
+            file_name="metrics.csv", mime="text/csv")
 
         st.subheader("📈 Equity Curves")
         eq_df = pd.DataFrame(eq_curves)
         st.line_chart(eq_df)
+
+        st.download_button("⬇️ Download equity curves (CSV)",
+            data=eq_df.to_csv().encode("utf-8"),
+            file_name="equity_curves.csv", mime="text/csv")
 
