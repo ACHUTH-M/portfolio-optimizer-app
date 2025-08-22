@@ -74,11 +74,27 @@ def simulate_equal_weight(df: pd.DataFrame, tc=0.0005) -> pd.Series:
     return r
 
 def simulate_buy_and_hold(df: pd.DataFrame) -> pd.Series:
-    w0 = np.ones(df.shape[1]) / df.shape[1]
+    # start equal-weighted (align to columns!)
+    w0 = pd.Series(np.ones(df.shape[1]) / df.shape[1], index=df.columns)
+
+    # grow each asset with its own cumulative return
     eq = (1.0 + df).cumprod()
-    wts = eq.div(eq.sum(axis=1), axis=0)  # value weights
-    r = (df * wts.shift().fillna(w0)).sum(axis=1)
+
+    # value weights each day (normalize across columns)
+    wts = eq.div(eq.sum(axis=1), axis=0)
+
+    # use previous day's weights to compute today's portfolio return
+    wts_shifted = wts.shift()
+
+    # for the very first day after shift (NaNs), use starting weights
+    if len(wts_shifted) > 0:
+        wts_shifted.iloc[0] = w0
+
+    # portfolio daily return
+    r = (df * wts_shifted).sum(axis=1)
     return r
+
+
 
 def simulate_naive_momentum(df: pd.DataFrame, lookback=60) -> pd.Series:
     roll = (1.0 + df).rolling(lookback).apply(lambda x: np.prod(x) - 1.0, raw=False)
@@ -171,4 +187,5 @@ if st.button("Run backtests"):
         st.subheader("📈 Equity Curves")
         eq_df = pd.DataFrame(eq_curves)
         st.line_chart(eq_df)
+
 
