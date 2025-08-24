@@ -300,30 +300,53 @@ if live_mode:
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_prices(tickers: list[str], lookback: int, interval: str) -> pd.DataFrame:
     """
-    Fetch OHLCV (Adj Close) with yfinance; return price DataFrame (Adj Close).
-    Cached for `ttl` seconds to lighten API calls.
+    Fetch adjusted close prices via yfinance.
+    Cached for `ttl` seconds to reduce API calls.
     """
     tickers = [t.strip().upper() for t in tickers if t.strip()]
     if not tickers:
         return pd.DataFrame()
-    # yfinance period must be a string like '30d'. We’ll request more than lookback to be safe.
-    period = f"{max(lookback, 5)}d"
-    data = yf.download(tickers=tickers, period=period, interval=interval, auto_adjust=True, progress=False)
-    # yfinance returns multi-index columns for multiple tickers; normalize to a simple wide DF
-    if isinstance(data.columns, pd.MultiIndex):
-        prices = data["Close"].copy() if "Close" in data else data["Adj Close"].copy()
+
+    # Yahoo constraints: very short intervals only allow ~7 days
+    if interval in ("1m", "2m", "5m", "15m", "30m", "60m", "90m"):
+        min_days = 7
+    else:
+        min_days = 30
+    period_days = max(lookback, min_days)
+    period = f"{period_days}d"
+
+    data = yf.download(
+        tickers=" ".join(tickers),
+        period=period,
+        interval=interval,
+        auto_adjust=True,
+        progress=False,
+        threads=True,
+    )
+
+    if isinstance(data, pd.DataFrame) and isinstance(data.columns, pd.MultiIndex):
+        if "Close" in data.columns.levels[0]:
+            prices = data["Close"].copy()
+        elif "Adj Close" in data.columns.levels[0]:
+            prices = data["Adj Close"].copy()
+        else:
+            top = data.columns.levels[0][0]
+            prices = data[top].copy()
     else:
         prices = data.copy()
-    prices = prices.dropna(how="all")
-    # Some single-ticker returns as Series; make it DataFrame
+
     if isinstance(prices, pd.Series):
         prices = prices.to_frame(name=tickers[0])
-    prices.columns = [c.split(" ")[0] for c in prices.columns]  # tidy names
-    # Restrict to last N days
+
+    prices = prices.dropna(how="all")
+    prices.columns = [str(c).split()[0] for c in prices.columns]
+
     if lookback > 0 and len(prices) > 0:
         cutoff = prices.index.max() - pd.Timedelta(days=lookback)
         prices = prices[prices.index >= cutoff]
+
     return prices
+
 
 def parse_weights(tickers: list[str], equal: bool, custom_text: str) -> pd.Series:
     if equal or not custom_text.strip():
@@ -384,6 +407,7 @@ else:
         # Optional: show last few price rows for debugging
         with st.expander("Show raw latest prices"):
             st.dataframe(prices.tail())
+
 
 
 
