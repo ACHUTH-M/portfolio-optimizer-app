@@ -3,6 +3,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 from scipy.optimize import minimize
+import matplotlib.pyplot as plt
 
 st.set_page_config(page_title="Portfolio Optimizer", layout="wide")
 
@@ -45,7 +46,6 @@ def eval_portfolio(port_rets: pd.Series, weights_history=None, freq_code="D"):
             "Calmar": calmar, "MaxDD": maxdd, "VaR5": var5, "CVaR5": cvar5, "Turnover": turnover}, eq
 
 def apply_rebalance_freq(rets: pd.DataFrame, freq_label: str) -> pd.DataFrame:
-    """Resample returns to the chosen rebalance frequency (by compounding)."""
     if freq_label == "Daily":
         return rets
     rule = {"Weekly": "W-FRI", "Monthly": "M"}[freq_label]
@@ -61,37 +61,26 @@ def apply_rebalance_freq(rets: pd.DataFrame, freq_label: str) -> pd.DataFrame:
 def load_data(file) -> pd.DataFrame:
     df_raw = pd.read_csv(file)
 
-    # Auto-detect date col (case-insensitive); fallback to first col
+    # Find date column
     date_col = None
     for c in df_raw.columns:
         if any(k in str(c).lower() for k in ("date", "time", "timestamp")):
-            date_col = c; break
+            date_col = c
+            break
     if date_col is None:
         date_col = df_raw.columns[0]
 
-    # Parse dates (mixed formats + day-first support)
-    df_raw[date_col] = pd.to_datetime(
-        df_raw[date_col],
-        errors="coerce",
-        dayfirst=True,
-        format="mixed"  # pandas >= 2.0
-    )
-    df = (df_raw
-          .dropna(subset=[date_col])
-          .set_index(date_col)
-          .sort_index())
+    df_raw[date_col] = pd.to_datetime(df_raw[date_col], errors="coerce", dayfirst=True, format="mixed")
+    df = (df_raw.dropna(subset=[date_col]).set_index(date_col).sort_index())
 
-    # Keep only numeric asset columns
     num = df.select_dtypes(include=["number"]).copy()
     if num.shape[1] == 0:
         raise ValueError("No numeric asset columns found after parsing.")
 
-    # Prices or returns?
     if (num.max() > 5).any():
         st.info("Detected prices — converting to simple daily returns.")
         num = num.pct_change().replace([np.inf, -np.inf], np.nan).dropna(how="any")
 
-    # Continuous daily index & forward-fill
     all_days = pd.date_range(num.index.min(), num.index.max(), freq="D")
     num = num.reindex(all_days).ffill().dropna(how="all")
     num.index.name = "Date"
@@ -99,13 +88,13 @@ def load_data(file) -> pd.DataFrame:
     return num
 
 # =========================
-# Strategies (with TC support)
+# Strategies
 # =========================
 def simulate_equal_weight(df: pd.DataFrame, tc=0.0):
     N = df.shape[1]
     w = np.ones(N)/N
     r = df @ w
-    hist = [w.copy()] * len(df)  # constant weights → no turnover
+    hist = [w.copy()] * len(df)
     return r.astype(float), hist
 
 def simulate_buy_and_hold(df: pd.DataFrame, tc=0.0):
@@ -119,11 +108,7 @@ def simulate_buy_and_hold(df: pd.DataFrame, tc=0.0):
     for i in range(1, len(wts_shifted)):
         hist.append(wts_shifted.iloc[i].values)
     r = (df * wts_shifted).sum(axis=1)
-    w_arr = np.vstack(hist)
-    turnover = np.abs(np.diff(w_arr, axis=0)).sum(axis=1)
-    cost = np.insert(tc * turnover, 0, 0.0)
-    r_net = r - cost
-    return r_net.astype(float), [w for w in hist]
+    return r.astype(float), [w for w in hist]
 
 def simulate_naive_momentum(df: pd.DataFrame, lookback=60, tc=0.0):
     N = df.shape[1]
@@ -138,7 +123,6 @@ def simulate_naive_momentum(df: pd.DataFrame, lookback=60, tc=0.0):
             mom = roll.iloc[t].values
             pos = np.clip(mom, 0, None)
             w_new = pos/pos.sum() if pos.sum() > 0 else np.ones(N)/N
-            out[-1] -= tc * np.abs(w_new - w_curr).sum()
             w_curr = w_new
         hist.append(w_curr.copy())
     return pd.Series(out, index=df.index), hist
@@ -155,7 +139,6 @@ def simulate_inverse_vol(df: pd.DataFrame, lookback=60, tc=0.0, eps=1e-8):
             vol = df.iloc[t-lookback+1:t+1].std().values + eps
             inv = 1.0 / vol
             w_new = inv / inv.sum()
-            out[-1] -= tc * np.abs(w_new - w_curr).sum()
             w_curr = w_new
         hist.append(w_curr.copy())
     return pd.Series(out, index=df.index), hist
@@ -179,7 +162,6 @@ def simulate_min_variance(df: pd.DataFrame, lookback=60, tc=0.0):
         out.append(float(np.dot(w_curr, r_vec)))
         if t >= lookback-1:
             w_new = minvar(df.iloc[t-lookback+1:t+1])
-            out[-1] -= tc * np.abs(w_new - w_curr).sum()
             w_curr = w_new
         hist.append(w_curr.copy())
     return pd.Series(out, index=df.index), hist
@@ -193,9 +175,9 @@ def simulate_rl_placeholder(df: pd.DataFrame):
     return r, hist
 
 # =========================
-# UI — data & controls
+# UI
 # =========================
-st.title("📈 Portfolio Optimizer with Baselines & RL")
+st.title("Portfolio Optimizer with Baselines & RL")
 
 uploaded = st.file_uploader("Upload your returns.csv or prices.csv", type=["csv"])
 if not uploaded:
@@ -208,61 +190,52 @@ try:
     st.dataframe(rets.head())
 except Exception as e:
     st.error(f"Failed to read your CSV. Details: {e}")
-    st.write("**Tips:** First column must be a date; other columns numeric prices/returns.")
     st.stop()
 
 with st.sidebar:
-    st.header("⚙️ Settings")
+    st.header("Settings")
     freq_label = st.selectbox("Rebalance frequency", ["Daily", "Weekly", "Monthly"], index=0)
-    tc_bps = st.slider("Transaction cost (bps per 100% turnover)", 0, 50, 5, help="10 bps = 0.0010 cost")
-    tc = tc_bps / 10000.0
-    lookback = st.slider("Lookback for Momentum / Inverse Vol / MinVar", 20, 180, 60)
+    lookback = st.slider("Lookback (days) for Momentum / Inverse Vol / MinVar", 20, 180, 60)
     enabled = st.multiselect(
         "Strategies to run",
         ["Equal Weight","Buy & Hold","Momentum","Inverse Vol","Min Variance","RL (placeholder)"],
         default=["Equal Weight","Buy & Hold","Momentum","Inverse Vol","Min Variance","RL (placeholder)"]
     )
 
-# Apply chosen rebalance frequency
 rets_use = apply_rebalance_freq(rets, freq_label)
 freq_code = {"Daily":"D","Weekly":"W","Monthly":"M"}[freq_label]
 
-# =========================
-# Run backtests
-# =========================
 if st.button("Run backtests"):
     with st.spinner("Running strategies…"):
         sims = {}
         if "Equal Weight" in enabled:
-            sims["Equal Weight"] = simulate_equal_weight(rets_use, tc=tc)
+            sims["Equal Weight"] = simulate_equal_weight(rets_use)
         if "Buy & Hold" in enabled:
-            sims["Buy & Hold"] = simulate_buy_and_hold(rets_use, tc=tc)
+            sims["Buy & Hold"] = simulate_buy_and_hold(rets_use)
         if "Momentum" in enabled:
-            sims["Momentum"] = simulate_naive_momentum(rets_use, lookback=lookback, tc=tc)
+            sims["Momentum"] = simulate_naive_momentum(rets_use, lookback=lookback)
         if "Inverse Vol" in enabled:
-            sims["Inverse Vol"] = simulate_inverse_vol(rets_use, lookback=lookback, tc=tc)
+            sims["Inverse Vol"] = simulate_inverse_vol(rets_use, lookback=lookback)
         if "Min Variance" in enabled:
-            sims["Min Variance"] = simulate_min_variance(rets_use, lookback=lookback, tc=tc)
+            sims["Min Variance"] = simulate_min_variance(rets_use, lookback=lookback)
         if "RL (placeholder)" in enabled:
             sims["RL (placeholder)"] = simulate_rl_placeholder(rets_use)
 
-        # Common index for fair comparison
         common_idx = None
         for r, _w in sims.values():
             common_idx = r.index if common_idx is None else common_idx.intersection(r.index)
 
-        # Metrics & curves
-        rows, eq_curves = [], {}
+        metrics_rows, eq_curves = [], {}
         for name, (r, w_hist) in sims.items():
             aligned = r.reindex(common_idx).dropna()
             perf, eq = eval_portfolio(aligned, w_hist, freq_code=freq_code)
-            rows.append([name, perf["CAGR"], perf["Volatility"], perf["Sharpe"],
-                         perf["Sortino"], perf["Calmar"], perf["MaxDD"],
-                         perf["VaR5"], perf["CVaR5"], perf["Turnover"]])
+            metrics_rows.append([name, perf["CAGR"], perf["Volatility"], perf["Sharpe"],
+                                 perf["Sortino"], perf["Calmar"], perf["MaxDD"],
+                                 perf["VaR5"], perf["CVaR5"], perf["Turnover"]])
             eq_curves[name] = eq
 
-        st.subheader("📊 Strategy Comparison")
-        metrics_df = pd.DataFrame(rows, columns=[
+        st.subheader("Strategy Comparison")
+        metrics_df = pd.DataFrame(metrics_rows, columns=[
             "Strategy","CAGR","Volatility","Sharpe","Sortino","Calmar","MaxDD","VaR5","CVaR5","Turnover"
         ])
         st.dataframe(metrics_df.style.format({
@@ -270,61 +243,34 @@ if st.button("Run backtests"):
             "Calmar":"{:.2f}","MaxDD":"{:.2%}","VaR5":"{:.2%}","CVaR5":"{:.2%}","Turnover":"{:.2f}"
         }))
 
-        st.download_button("⬇️ Download metrics (CSV)",
-            data=metrics_df.to_csv(index=False).encode("utf-8"),
-            file_name="metrics.csv", mime="text/csv")
-
-        st.subheader("📈 Equity Curves")
+        st.subheader("Equity Curves")
         eq_df = pd.DataFrame(eq_curves)
         st.line_chart(eq_df)
 
-        st.download_button("⬇️ Download equity curves (CSV)",
-                           # -------------------------
-# Allocation pie chart
-# -------------------------
-st.subheader("🍰 Average Allocation by Strategy")
+        # ======================
+        # Pie chart section
+        # ======================
+        st.subheader("Average Allocation by Strategy")
+        strategy_for_pie = st.selectbox("Select strategy for pie chart", list(sims.keys()))
+        r_sel, w_hist_sel = sims[strategy_for_pie]
+        W = np.vstack(w_hist_sel[:len(r_sel)])
+        wdf = pd.DataFrame(W, index=r_sel.index[:len(W)], columns=rets_use.columns)
+        wdf = wdf.reindex(common_idx).dropna(how="any")
 
-# Let the user pick a strategy to inspect
-strategy_for_pie = st.selectbox("Select strategy", list(sims.keys()))
+        avg_w = wdf.mean(axis=0)
+        latest_w = wdf.iloc[-1]
 
-# Grab its returns and weight history
-r_sel, w_hist_sel = sims[strategy_for_pie]
-
-# Build a weight dataframe aligned to the strategy's own index,
-# then restrict to the common comparison window.
-# Many strategies stored len(df)+1 weights, so trim to len(r).
-W = np.vstack(w_hist_sel[:len(r_sel)])
-wdf = pd.DataFrame(W, index=r_sel.index[:len(W)], columns=rets_use.columns)
-wdf = wdf.reindex(common_idx).dropna(how="any")
-
-# Average allocation over time (and also show the latest if you like)
-avg_w = wdf.mean(axis=0)
-latest_w = wdf.iloc[-1]
-
-col1, col2 = st.columns(2)
-
-with col1:
-    st.caption("Average weights over the evaluation window")
-    fig1, ax1 = plt.subplots(figsize=(4.8, 4.8))
-    ax1.pie(avg_w.values, labels=avg_w.index, autopct="%1.1f%%", startangle=90)
-    ax1.axis("equal")
-    st.pyplot(fig1)
-
-with col2:
-    st.caption("Last rebalanced weights")
-    fig2, ax2 = plt.subplots(figsize=(4.8, 4.8))
-    ax2.pie(latest_w.values, labels=latest_w.index, autopct="%1.1f%%", startangle=90)
-    ax2.axis("equal")
-    st.pyplot(fig2)
-
-# Optional CSV downloads for documentation
-pie_df = pd.DataFrame({"AverageWeight": avg_w, "LastWeight": latest_w})
-st.download_button("⬇️ Download weights (CSV)",
-                   data=pie_df.to_csv().encode("utf-8"),
-                   file_name=f"{strategy_for_pie.replace(' ','_').lower()}_weights.csv",
-                   mime="text/csv")
-
-            data=eq_df.to_csv().encode("utf-8"),
-            file_name="equity_curves.csv", mime="text/csv")
-
+        col1, col2 = st.columns(2)
+        with col1:
+            st.caption("Average weights over the evaluation window")
+            fig1, ax1 = plt.subplots(figsize=(4.5,4.5))
+            ax1.pie(avg_w.values, labels=avg_w.index, autopct="%1.1f%%", startangle=90)
+            ax1.axis("equal")
+            st.pyplot(fig1)
+        with col2:
+            st.caption("Last rebalanced weights")
+            fig2, ax2 = plt.subplots(figsize=(4.5,4.5))
+            ax2.pie(latest_w.values, labels=latest_w.index, autopct="%1.1f%%", startangle=90)
+            ax2.axis("equal")
+            st.pyplot(fig2)
 
