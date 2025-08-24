@@ -273,4 +273,116 @@ if st.button("Run backtests"):
             ax2.pie(latest_w.values, labels=latest_w.index, autopct="%1.1f%%", startangle=90)
             ax2.axis("equal")
             st.pyplot(fig2)
+            # ======================================================
+# Live Portfolio (beta)
+# ======================================================
+st.markdown("---")
+st.header("Live Portfolio (beta)")
+
+with st.expander("Live settings"):
+    st.write("Enter tickers (comma-separated) and choose a refresh rate.")
+    tickers_text = st.text_input("Tickers (comma-separated)", value="AAPL, MSFT, NVDA, GOOGL")
+    live_mode = st.checkbox("Enable live auto-refresh", value=False,
+                            help="Refresh the chart automatically while this page is open.")
+    refresh_sec = st.slider("Refresh interval (seconds)", min_value=10, max_value=300, value=60, step=10)
+    price_interval = st.selectbox("Price interval", ["1m", "2m", "5m", "15m", "30m", "60m", "1d"], index=6,
+                                  help="Note: very short intervals might be limited/delayed on some tickers/exchanges.")
+    lookback_days = st.slider("Lookback (days) for the live plot", 1, 365, 180, help="How far back to show the live chart")
+    equal_w = st.checkbox("Use equal weights", value=True)
+    custom_w_text = st.text_input("Custom weights (optional, comma-separated, sums to 1)", value="")
+
+# Optional auto-refresh (does nothing unless live_mode=True)
+if live_mode:
+    st.autorefresh(interval=refresh_sec * 1000, key="live_portfolio_refresher")
+
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_prices(tickers: list[str], lookback: int, interval: str) -> pd.DataFrame:
+    """
+    Fetch OHLCV (Adj Close) with yfinance; return price DataFrame (Adj Close).
+    Cached for `ttl` seconds to lighten API calls.
+    """
+    tickers = [t.strip().upper() for t in tickers if t.strip()]
+    if not tickers:
+        return pd.DataFrame()
+    # yfinance period must be a string like '30d'. We’ll request more than lookback to be safe.
+    period = f"{max(lookback, 5)}d"
+    data = yf.download(tickers=tickers, period=period, interval=interval, auto_adjust=True, progress=False)
+    # yfinance returns multi-index columns for multiple tickers; normalize to a simple wide DF
+    if isinstance(data.columns, pd.MultiIndex):
+        prices = data["Close"].copy() if "Close" in data else data["Adj Close"].copy()
+    else:
+        prices = data.copy()
+    prices = prices.dropna(how="all")
+    # Some single-ticker returns as Series; make it DataFrame
+    if isinstance(prices, pd.Series):
+        prices = prices.to_frame(name=tickers[0])
+    prices.columns = [c.split(" ")[0] for c in prices.columns]  # tidy names
+    # Restrict to last N days
+    if lookback > 0 and len(prices) > 0:
+        cutoff = prices.index.max() - pd.Timedelta(days=lookback)
+        prices = prices[prices.index >= cutoff]
+    return prices
+
+def parse_weights(tickers: list[str], equal: bool, custom_text: str) -> pd.Series:
+    if equal or not custom_text.strip():
+        w = pd.Series(np.ones(len(tickers)) / len(tickers), index=tickers, dtype=float)
+        return w
+    # parse custom weights
+    try:
+        vals = [float(x) for x in custom_text.split(",")]
+        vals = np.array(vals, dtype=float)
+        if len(vals) != len(tickers):
+            raise ValueError("Number of weights must match number of tickers.")
+        if np.isclose(vals.sum(), 0.0):
+            raise ValueError("Weights sum to zero.")
+        vals = vals / vals.sum()
+        return pd.Series(vals, index=tickers, dtype=float)
+    except Exception as e:
+        st.warning(f"Could not parse custom weights: {e}. Falling back to equal weights.")
+        return pd.Series(np.ones(len(tickers)) / len(tickers), index=tickers, dtype=float)
+
+# Build the live portfolio
+tickers = [t.strip().upper() for t in tickers_text.split(",") if t.strip()]
+if len(tickers) == 0:
+    st.info("Enter at least one ticker above to see a live portfolio.")
+else:
+    prices = fetch_prices(tickers, lookback=lookback_days, interval=price_interval)
+    if prices.empty:
+        st.warning("No live price data returned. Try a longer interval (e.g., 1d) or different tickers.")
+    else:
+        # Compute live returns
+        rets_live = prices.pct_change().dropna(how="any")
+        weights_live = parse_weights(tickers, equal_w, custom_w_text).reindex(rets_live.columns).fillna(0.0)
+
+        # Portfolio returns + equity
+        port_live = (rets_live @ weights_live).astype(float)
+        eq_live = (1.0 + port_live).cumprod()
+        latest_ts = eq_live.index.max()
+        # Show numbers
+        colA, colB = st.columns([3, 2])
+
+        with colA:
+            st.subheader("Live Portfolio Equity")
+            st.line_chart(eq_live, height=320)
+            st.caption(f"Last update: **{latest_ts}** (timezone = data source)")
+
+        with colB:
+            st.subheader("Current Allocation")
+            # Current weights based on latest prices (value-weighted with the chosen static target)
+            # For this simple live view, we plot the target weights; you could switch to value weights if desired.
+            fig, ax = plt.subplots(figsize=(4.5, 4.5))
+            ax.pie(weights_live.values, labels=weights_live.index, autopct="%1.1f%%", startangle=90)
+            ax.axis("equal")
+            st.pyplot(fig)
+
+        # Daily stats block
+        if len(port_live) > 0:
+            daily_ret = float(port_live.iloc[-1])
+            st.metric("Latest Period Return", f"{daily_ret:.2%}")
+        # Optional: show last few price rows for debugging
+        with st.expander("Show raw latest prices"):
+            st.dataframe(prices.tail())
+
+
+
 
