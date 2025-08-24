@@ -279,6 +279,52 @@ if st.button("Run backtests"):
         st.line_chart(eq_df)
 
         st.download_button("⬇️ Download equity curves (CSV)",
+                           # -------------------------
+# Allocation pie chart
+# -------------------------
+st.subheader("🍰 Average Allocation by Strategy")
+
+# Let the user pick a strategy to inspect
+strategy_for_pie = st.selectbox("Select strategy", list(sims.keys()))
+
+# Grab its returns and weight history
+r_sel, w_hist_sel = sims[strategy_for_pie]
+
+# Build a weight dataframe aligned to the strategy's own index,
+# then restrict to the common comparison window.
+# Many strategies stored len(df)+1 weights, so trim to len(r).
+W = np.vstack(w_hist_sel[:len(r_sel)])
+wdf = pd.DataFrame(W, index=r_sel.index[:len(W)], columns=rets_use.columns)
+wdf = wdf.reindex(common_idx).dropna(how="any")
+
+# Average allocation over time (and also show the latest if you like)
+avg_w = wdf.mean(axis=0)
+latest_w = wdf.iloc[-1]
+
+col1, col2 = st.columns(2)
+
+with col1:
+    st.caption("Average weights over the evaluation window")
+    fig1, ax1 = plt.subplots(figsize=(4.8, 4.8))
+    ax1.pie(avg_w.values, labels=avg_w.index, autopct="%1.1f%%", startangle=90)
+    ax1.axis("equal")
+    st.pyplot(fig1)
+
+with col2:
+    st.caption("Last rebalanced weights")
+    fig2, ax2 = plt.subplots(figsize=(4.8, 4.8))
+    ax2.pie(latest_w.values, labels=latest_w.index, autopct="%1.1f%%", startangle=90)
+    ax2.axis("equal")
+    st.pyplot(fig2)
+
+# Optional CSV downloads for documentation
+pie_df = pd.DataFrame({"AverageWeight": avg_w, "LastWeight": latest_w})
+st.download_button("⬇️ Download weights (CSV)",
+                   data=pie_df.to_csv().encode("utf-8"),
+                   file_name=f"{strategy_for_pie.replace(' ','_').lower()}_weights.csv",
+                   mime="text/csv")
+
             data=eq_df.to_csv().encode("utf-8"),
             file_name="equity_curves.csv", mime="text/csv")
+
 
