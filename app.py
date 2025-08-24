@@ -4,6 +4,8 @@ import pandas as pd
 import numpy as np
 from scipy.optimize import minimize
 import matplotlib.pyplot as plt
+import yfinance as yf
+
 
 st.set_page_config(page_title="Portfolio Optimizer", layout="wide")
 
@@ -382,6 +384,7 @@ else:
         # Optional: show last few price rows for debugging
         with st.expander("Show raw latest prices"):
             st.dataframe(prices.tail())
+
 
 
 
